@@ -207,7 +207,7 @@ module.exports = async function handler(req, res) {
     const calResp = await fetch("https://api.cal.com/v2/bookings", {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+      Authorization: "Bearer " + apiKey,
         "Content-Type": "application/json",
         "cal-api-version": "2024-08-13",
       },
