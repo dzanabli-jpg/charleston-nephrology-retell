@@ -22,11 +22,10 @@ function normalizeUSPhoneToE164(phoneLike) {
   const raw = String(phoneLike || "").trim();
   const digits = normalizeDigits(raw);
 
-  if (digits.length === 10) return `+1${digits}`;
-  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  if (digits.length === 10) return "+1" + digits;
+  if (digits.length === 11 && digits.startsWith("1")) return "+" + digits;
 
-  // If it already had a + and enough digits, keep it as +digits
-  if (raw.startsWith("+") && digits.length >= 11) return `+${digits}`;
+  if (raw.startsWith("+") && digits.length >= 11) return "+" + digits;
 
   return null;
 }
