@@ -107,13 +107,15 @@ module.exports = async function handler(req, res) {
     }
 
     // ---- Cal.com API call ----
-    const calResp = await fetch("https://api.cal.com/v1/bookings", {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-    });
+   const calResp = await fetch("https://api.cal.com/v2/bookings", {
+  method: "GET",
+  headers: {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+    "cal-api-version": "2024-08-13",
+  },
+});
+
 
     const calJson = await calResp.json().catch(() => null);
 
