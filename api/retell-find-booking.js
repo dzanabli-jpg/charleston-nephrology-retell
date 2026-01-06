@@ -1,114 +1,150 @@
-export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+// /api/retell-find-booking.js
 
-  // Retell auth guard
-  const auth = req.headers.authorization || "";
-  const expected = `Bearer ${process.env.RETELL_SHARED_SECRET}`;
-  if (!process.env.RETELL_SHARED_SECRET || auth !== expected) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  const { full_name, phone_number } = req.body || {};
-if (!full_name || !phone_number) {
-  return res.status(400).json({
-    error: "Missing full_name or phone_number",
-    got_type: typeof body,
-    got_isArray: Array.isArray(body),
-    got_keys: body && typeof body === "object" ? Object.keys(body) : null,
-    got_body: body
-  });
+function normalizeDigits(str) {
+  return String(str || "").replace(/\D/g, "");
 }
 
+function normalizeUSPhoneToE164(phoneLike) {
+  const digits = normalizeDigits(phoneLike);
 
-  const calKey = process.env.CALCOM_API_KEY;
-  if (!calKey) return res.status(500).json({ error: "Missing CALCOM_API_KEY in env" });
+  // If user gave 10 digits, assume US
+  if (digits.length === 10) return `+1${digits}`;
 
-  const EVENT_TYPE_IDS = ["4323791", "4323781"]; // follow-up, new patient
-  const normalizePhone = (p) => String(p || "").replace(/[^\d]/g, "");
-  const last10 = (p) => {
-    const d = normalizePhone(p);
-    return d.length >= 10 ? d.slice(-10) : d;
-  };
+  // If user gave 11 digits starting with 1, treat as US
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
 
-  const target = last10(phone_number);
+  // If already includes country code with + but had symbols, fallback:
+  if (String(phoneLike || "").trim().startsWith("+") && digits.length >= 11) {
+    return `+${digits}`;
+  }
 
-  // Pull upcoming-ish bookings for both event types
-  // Cal.com API v2 supports status + eventTypeIds + sorting + pagination. :contentReference[oaicite:2]{index=2}
-  const url = new URL("https://api.cal.com/v2/bookings");
-  url.searchParams.set("eventTypeIds", EVENT_TYPE_IDS.join(",")); // supports comma-separated ids :contentReference[oaicite:3]{index=3}
-  url.searchParams.set("status", "upcoming,unconfirmed"); // comma-separated allowed :contentReference[oaicite:4]{index=4}
-  url.searchParams.set("take", "100");
-  url.searchParams.set("skip", "0");
-  url.searchParams.set("sortStart", "asc");
+  // Otherwise return null to signal invalid
+  return null;
+}
 
-  // Optional: attendeeName filter can reduce noise (not required)
-  // url.searchParams.set("attendeeName", full_name);
+function last10(digitsOrE164) {
+  const d = normalizeDigits(digitsOrE164);
+  return d.length >= 10 ? d.slice(-10) : null;
+}
 
+function normName(str) {
+  return String(str || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+export default async function handler(req, res) {
   try {
-    const r = await fetch(url.toString(), {
+    // Only allow POST
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "Method not allowed" });
+    }
+
+    // Auth check (Retell -> your endpoint)
+    const auth = req.headers.authorization || "";
+    const expected = process.env.RETELL_SHARED_SECRET;
+    if (!expected) {
+      return res.status(500).json({ error: "Server misconfigured: missing RETELL_SHARED_SECRET" });
+    }
+    if (!auth.startsWith("Bearer ") || auth.slice(7).trim() !== expected) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const body = req.body || {};
+
+    // Support multiple payload shapes Retell may send
+    let full_name =
+      body.full_name ??
+      body.fullName ??
+      body.name ??
+      body?.args?.full_name ??
+      body?.args?.fullName ??
+      body?.args?.name ??
+      null;
+
+    let phone_number =
+      body.phone_number ??
+      body.phoneNumber ??
+      body.attendeePhoneNumber ??
+      body?.args?.phone_number ??
+      body?.args?.phoneNumber ??
+      body?.args?.attendeePhoneNumber ??
+      null;
+
+    // args-only array payload: ["Emily Smith", "+1304..."]
+    if ((!full_name || !phone_number) && Array.isArray(body)) {
+      full_name = full_name || body[0] || null;
+      phone_number = phone_number || body[1] || null;
+    }
+
+    // payload like { args: ["Emily Smith", "+1304..."] }
+    if ((!full_name || !phone_number) && Array.isArray(body.args)) {
+      full_name = full_name || body.args[0] || null;
+      phone_number = phone_number || body.args[1] || null;
+    }
+
+    if (!full_name || !phone_number) {
+      return res.status(400).json({
+        error: "Missing full_name or phone_number",
+        got_type: typeof body,
+        got_isArray: Array.isArray(body),
+        got_keys: body && typeof body === "object" ? Object.keys(body) : null,
+        got_body: body,
+      });
+    }
+
+    const normalizedPhone = normalizeUSPhoneToE164(phone_number);
+    const phoneLast10 = last10(normalizedPhone);
+
+    if (!normalizedPhone || !phoneLast10) {
+      return res.status(400).json({
+        error: "Invalid phone number after normalization",
+        phone_number_received: phone_number,
+        normalizedPhone,
+      });
+    }
+
+    const apiKey = process.env.CALCOM_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "Server misconfigured: missing CALCOM_API_KEY" });
+    }
+
+    // ---- Cal.com API call ----
+    // NOTE: Cal.com API versions vary; this endpoint works for many setups.
+    // If your Cal.com uses a different path, we can adjust once we see the response.
+    const calResp = await fetch("https://api.cal.com/v1/bookings", {
       method: "GET",
       headers: {
-        "Authorization": `Bearer ${calKey}`,
-        "cal-api-version": "2024-08-13" // required for v2 behavior :contentReference[oaicite:5]{index=5}
-      }
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
     });
 
-    const payload = await r.json().catch(() => ({}));
-    if (!r.ok || payload?.status !== "success") {
-      return res.status(r.status || 500).json({
-        found: false,
-        reason: "calcom_error",
-        calcom: payload
+    const calJson = await calResp.json().catch(() => null);
+
+    if (!calResp.ok) {
+      return res.status(502).json({
+        error: "Cal.com API error",
+        status: calResp.status,
+        response: calJson,
       });
     }
 
-    const bookings = Array.isArray(payload.data) ? payload.data : [];
-    const matches = bookings
-      .map((b) => {
-        const attendees = Array.isArray(b.attendees) ? b.attendees : [];
-        const attendeePhones = attendees
-          .map((a) => a?.phoneNumber)
-          .filter(Boolean);
+    const bookings = Array.isArray(calJson?.bookings) ? calJson.bookings : [];
 
-        const matched = attendeePhones.some((p) => last10(p) === target);
-        return matched
-          ? {
-              booking_uid: b.uid,
-              start_time: b.start,
-              end_time: b.end,
-              status: b.status,
-              eventTypeId: b.eventTypeId,
-              attendee_name: attendees?.[0]?.name || null
-            }
-          : null;
-      })
-      .filter(Boolean);
+    const targetName = normName(full_name);
 
-    if (matches.length === 0) {
-      return res.status(200).json({
-        found: false,
-        reason: "no_match",
-        searched_eventTypeIds: EVENT_TYPE_IDS
-      });
-    }
+    // Try to find matches by phone last-10 and name similarity.
+    // This is intentionally forgiving about formatting.
+    const matches = [];
+    for (const b of bookings) {
+      const attendees = Array.isArray(b?.attendees) ? b.attendees : [];
+      const bookingUid = b?.uid || b?.id || null;
 
-    if (matches.length === 1) {
-      return res.status(200).json({
-        found: true,
-        booking_uid: matches[0].booking_uid,
-        start_time: matches[0].start_time,
-        end_time: matches[0].end_time,
-        eventTypeId: matches[0].eventTypeId
-      });
-    }
+      // Pull attendee phone candidates
+      const phones = attendees
+        .map((a) => a?.phoneNumber || a?.phone || a?.attendeePhoneNumber || "")
+        .filter(Boolean);
 
-    // Multiple matches: let the AI ask which one
-    return res.status(200).json({
-      found: false,
-      reason: "multiple_matches",
-      matches
-    });
-  } catch (e) {
-    return res.status(500).json({ found: false, reason: "exception", error: String(e) });
-  }
-}
+      // Sometimes phone i
