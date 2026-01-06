@@ -20,6 +20,7 @@ export default async function handler(req, res) {
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${calKey}`
+        "cal-api-version": "2024-08-13"
       },
       body: JSON.stringify({
         cancellationReason: reason || "Patient requested cancellation"
