@@ -1,34 +1,111 @@
-// /api/retell-normalize-phone.js (CommonJS - Retell helper)
-//
-// Purpose: Accept ANY phone-number phrasing/grouping and return a normalized US E.164 phone.
-// Example inputs (raw_phone):
-// - "three zero four, one one one, one one one one"
-// - "304-111-1111"
-// - "+1 304 111 1111"
-// - "one two three, one two three, one two three four"
+// /api/retell-normalize-phone.js (CommonJS - Retell helper, spoken-number aware)
 //
 // Env vars required:
 // - RETELL_SHARED_SECRET
+//
+// Accepts raw_phone as spoken words or digits and returns normalized US E.164 + pretty formatting.
 
 function digitsOnly(str) {
   return String(str || "").replace(/\D/g, "");
 }
 
-function normalizeUSPhoneToE164(rawPhone) {
-  var d = digitsOnly(rawPhone);
+function wordsToDigits(text) {
+  var s = String(text || "").toLowerCase();
 
-  // Common case: caller includes country code in digits
-  if (d.length === 11 && d.charAt(0) === "1") return "+" + d;
+  // Normalize punctuation to spaces
+  s = s.replace(/[^a-z0-9+]+/g, " ");
+  s = s.replace(/\s+/g, " ").trim();
 
-  // Standard US 10-digit
-  if (d.length === 10) return "+1" + d;
+  // Map number words to digits
+  var map = {
+    "zero": "0",
+    "oh": "0",
+    "o": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "for": "4",   // common ASR confusion
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "ate": "8",   // common ASR confusion
+    "nine": "9"
+  };
+
+  // Tokens
+  var tokens = s.split(" ").filter(Boolean);
+
+  var out = "";
+  for (var i = 0; i < tokens.length; i++) {
+    var t = tokens[i];
+
+    // If token already contains digits (e.g., "304" or "+1304")
+    if (/[0-9]/.test(t)) {
+      out += t.replace(/\D/g, "");
+      continue;
+    }
+
+    // Handle "double" / "triple"
+    if (t === "double" || t === "triple") {
+      var next = tokens[i + 1] || "";
+      var d = map[next] || (/[0-9]/.test(next) ? next.replace(/\D/g, "") : "");
+      if (d.length > 0) {
+        out += (t === "double") ? (d + d) : (d + d + d);
+        i += 1;
+      }
+      continue;
+    }
+
+    // Normal word->digit
+    if (map[t] !== undefined) {
+      out += map[t];
+      continue;
+    }
+
+    // Ignore unknown tokens
+  }
+
+  return out;
+}
+
+function normalizeUSPhoneToE164FromAny(rawPhone) {
+  var raw = String(rawPhone || "");
+
+  // First try direct digits
+  var d = digitsOnly(raw);
+
+  // If no digits, try converting words to digits
+  if (!d || d.length === 0) {
+    d = wordsToDigits(raw);
+  }
+
+  // Clean again (just digits)
+  d = digitsOnly(d);
+
+  // Normalize
+  if (d.length === 11 && d.charAt(0) === "1") return { e164: "+" + d, d10: d.slice(1) };
+  if (d.length === 10) return { e164: "+1" + d, d10: d };
 
   return null;
 }
 
 function formatPretty10(d10) {
-  // d10 must be exactly 10 digits
   return d10.slice(0, 3) + "-" + d10.slice(3, 6) + "-" + d10.slice(6);
+}
+
+function pick(body, keys) {
+  for (var i = 0; i < keys.length; i++) {
+    var k = keys[i];
+    if (body && body[k] !== undefined && body[k] !== null) return body[k];
+  }
+  return null;
+}
+
+function pickArgs(body, keys) {
+  if (!body || !body.args || typeof body.args !== "object") return null;
+  return pick(body.args, keys);
 }
 
 module.exports = async function handler(req, res) {
@@ -44,40 +121,40 @@ module.exports = async function handler(req, res) {
     }
 
     var body = req.body || {};
-    console.log("RETELL_NORMALIZE_PHONE_BODY", body);
 
-    // Accept a few possible shapes
     var raw_phone =
-      (body.args && (body.args.raw_phone || body.args.rawPhone || body.args.phone || body.args.phone_number)) ||
-      body.raw_phone ||
-      body.rawPhone ||
-      body.phone ||
-      body.phone_number ||
-      null;
+      pickArgs(body, ["raw_phone", "rawPhone", "phone_number", "phoneNumber", "phone", "number"]) ||
+      pick(body, ["raw_phone", "rawPhone", "phone_number", "phoneNumber", "phone", "number"]);
+
+    console.log("RETELL_NORMALIZE_PHONE_INPUT", { raw_phone: raw_phone });
 
     if (!raw_phone) {
       return res.status(400).json({ error: "Missing raw_phone" });
     }
 
-    var normalized = normalizeUSPhoneToE164(raw_phone);
-    if (!normalized) {
-      var d = digitsOnly(raw_phone);
+    var norm = normalizeUSPhoneToE164FromAny(raw_phone);
+
+    if (!norm) {
+      var directDigits = digitsOnly(raw_phone);
+      var wordDigits = wordsToDigits(raw_phone);
       return res.status(200).json({
         is_valid: false,
         normalized_e164: null,
         pretty: null,
-        digits_found: d,
-        digits_count: d.length,
+        last4: null,
+        digits_found_direct: directDigits,
+        digits_found_from_words: wordDigits,
+        digits_count_direct: directDigits.length,
+        digits_count_from_words: wordDigits.length,
         message: "Could not normalize to a US 10-digit number"
       });
     }
 
-    var d10 = digitsOnly(normalized).slice(-10);
     return res.status(200).json({
       is_valid: true,
-      normalized_e164: normalized,
-      pretty: formatPretty10(d10),
-      last4: d10.slice(-4),
+      normalized_e164: norm.e164,
+      pretty: formatPretty10(norm.d10),
+      last4: norm.d10.slice(-4),
       digits_count: 10
     });
   } catch (err) {
