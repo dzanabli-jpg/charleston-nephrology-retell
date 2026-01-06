@@ -9,9 +9,16 @@ export default async function handler(req, res) {
   }
 
   const { full_name, phone_number } = req.body || {};
-  if (!full_name || !phone_number) {
-    return res.status(400).json({ error: "Missing full_name or phone_number" });
-  }
+if (!full_name || !phone_number) {
+  return res.status(400).json({
+    error: "Missing full_name or phone_number",
+    got_type: typeof body,
+    got_isArray: Array.isArray(body),
+    got_keys: body && typeof body === "object" ? Object.keys(body) : null,
+    got_body: body
+  });
+}
+
 
   const calKey = process.env.CALCOM_API_KEY;
   if (!calKey) return res.status(500).json({ error: "Missing CALCOM_API_KEY in env" });
