@@ -4,15 +4,14 @@
 // - RETELL_SHARED_SECRET  (must exactly match the token after "Bearer " in Retell header)
 // - CALCOM_API_KEY        (your Cal.com API key)
 //
-// What this does:
-// - POST only (GET -> 405)
-// - Validates Authorization header
-// - Parses multiple Retell payload shapes (object, args object, arrays)
-// - Normalizes US phone to +1XXXXXXXXXX
-// - Calls Cal.com v2 bookings (with cal-api-version header)
-// - Matches by phone last-10 and name parts (first+last)
-// - Prevents bogus full_name values like "find_booking"
-// - Logs RETELL_REQUEST_BODY and FIND_BOOKING_RESULT for debugging
+// This endpoint:
+// - POST only
+// - validates Authorization
+// - reads args from Retell correctly (body.args.full_name / body.args.phone_number)
+// - never confuses body.name (tool name) as caller name
+// - normalizes US phone to +1XXXXXXXXXX
+// - fetches Cal.com v2 bookings and matches by phone last-10 + name parts
+// - logs RETELL_REQUEST_BODY and FIND_BOOKING_RESULT
 
 function normalizeDigits(str) {
   return String(str || "").replace(/\D/g, "");
@@ -45,26 +44,25 @@ function normName(str) {
 function extractArgs(body) {
   body = body || {};
 
-  // Prefer explicit keys
+  // ✅ PRIORITIZE Retell's tool-call args FIRST
   var full_name =
+    (body.args && (body.args.full_name || body.args.fullName || body.args.caller_name || body.args.callerName || body.args.name)) ||
     body.full_name ||
     body.fullName ||
     body.caller_name ||
     body.callerName ||
-    body.name ||
-    (body.args && (body.args.full_name || body.args.fullName || body.args.caller_name || body.args.callerName || body.args.name)) ||
     null;
 
   var phone_number =
+    (body.args && (body.args.phone_number || body.args.phoneNumber || body.args.caller_phone || body.args.callerPhone || body.args.attendeePhoneNumber)) ||
     body.phone_number ||
     body.phoneNumber ||
     body.caller_phone ||
     body.callerPhone ||
     body.attendeePhoneNumber ||
-    (body.args && (body.args.phone_number || body.args.phoneNumber || body.args.caller_phone || body.args.callerPhone || body.args.attendeePhoneNumber)) ||
     null;
 
-  // args-only array payload: ["Emily Smith", "+1304..."] OR ["Emily Smith", "3041111111"]
+  // args-only array payload: ["Emily Smith", "+1304..."]
   if ((!full_name || !phone_number) && Array.isArray(body)) {
     full_name = full_name || body[0] || null;
     phone_number = phone_number || body[1] || null;
@@ -81,12 +79,10 @@ function extractArgs(body) {
 
 module.exports = async function handler(req, res) {
   try {
-    // Only allow POST
     if (req.method !== "POST") {
       return res.status(405).json({ error: "Method not allowed" });
     }
 
-    // Auth check (Retell -> your endpoint)
     var expected = process.env.RETELL_SHARED_SECRET;
     if (!expected) {
       return res.status(500).json({ error: "Missing RETELL_SHARED_SECRET" });
@@ -98,44 +94,32 @@ module.exports = async function handler(req, res) {
     }
 
     var body = req.body || {};
-
-    // Helpful debug: shows what Retell actually sends
     console.log("RETELL_REQUEST_BODY", body);
 
     var args = extractArgs(body);
-var badName = String(args.full_name || "").trim().toLowerCase();
-if (badName === "find_booking" || badName.indexOf("find booking") !== -1 || badName.indexOf("manage") !== -1) {
-  return res.status(400).json({
-    error: "INVALID_FULL_NAME",
-    message: "Please provide the caller's real first and last name."
-  });
-}
 
     if (!args.full_name || !args.phone_number) {
       return res.status(400).json({
         error: "Missing full_name or phone_number",
-        got_type: typeof body,
-        got_isArray: Array.isArray(body),
         got_keys: body && typeof body === "object" ? Object.keys(body) : null,
         got_body: body
       });
     }
 
-    // Guard: Retell sometimes sends the tool name as the "full_name"
-    var badName = String(args.full_name || "").trim().toLowerCase();
-
-    // Must be a real first + last name (contains a space)
-    // Must not be the function name
-    if (
-      badName === "find_booking" ||
-      badName.indexOf("find booking") !== -1 ||
-      badName.length < 3 ||
-      badName.indexOf(" ") === -1
-    ) {
-      console.log("BAD_FULL_NAME_FROM_RETELL", { full_name: args.full_name, body: body });
+    // Guard against placeholders/tool names
+    var nameLower = String(args.full_name || "").trim().toLowerCase();
+    if (nameLower === "find_booking" || nameLower.indexOf("find booking") !== -1 || nameLower.indexOf("manage") !== -1) {
       return res.status(400).json({
         error: "INVALID_FULL_NAME",
         message: "full_name must be the caller's real first and last name"
+      });
+    }
+
+    // Require first + last name
+    if (String(args.full_name).trim().indexOf(" ") === -1) {
+      return res.status(400).json({
+        error: "INVALID_FULL_NAME",
+        message: "Please provide first and last name"
       });
     }
 
@@ -155,7 +139,6 @@ if (badName === "find_booking" || badName.indexOf("find booking") !== -1 || badN
       return res.status(500).json({ error: "Missing CALCOM_API_KEY" });
     }
 
-    // Cal.com v2 bookings
     var calResp = await fetch("https://api.cal.com/v2/bookings", {
       method: "GET",
       headers: {
@@ -180,7 +163,6 @@ if (badName === "find_booking" || badName.indexOf("find booking") !== -1 || badN
       });
     }
 
-    // Cal v2 usually returns { data: [...] }
     var bookings = [];
     if (calJson && Array.isArray(calJson.data)) bookings = calJson.data;
     else if (calJson && Array.isArray(calJson.bookings)) bookings = calJson.bookings;
@@ -192,7 +174,6 @@ if (badName === "find_booking" || badName.indexOf("find booking") !== -1 || badN
 
     for (var i = 0; i < bookings.length; i++) {
       var b = bookings[i] || {};
-
       var attendees = Array.isArray(b.attendees) ? b.attendees : [];
       var phones = [];
 
@@ -203,9 +184,14 @@ if (badName === "find_booking" || badName.indexOf("find booking") !== -1 || badN
         if (a.attendeePhoneNumber) phones.push(a.attendeePhoneNumber);
       }
 
-      // common custom fields
-      if (b.metadata && b.metadata.attendeePhoneNumber) phones.push(b.metadata.attendeePhoneNumber);
-      if (b.responses && b.responses.attendeePhoneNumber) phones.push(b.responses.attendeePhoneNumber);
+      // Cal v2 often stores custom answers here:
+      if (b.bookingFieldsResponses && typeof b.bookingFieldsResponses === "object") {
+        // collect any phone-like strings from bookingFieldsResponses
+        for (var key in b.bookingFieldsResponses) {
+          var val = b.bookingFieldsResponses[key];
+          if (typeof val === "string" && normalizeDigits(val).length >= 10) phones.push(val);
+        }
+      }
 
       // phone match by last-10
       var phoneMatch = false;
@@ -217,7 +203,7 @@ if (badName === "find_booking" || badName.indexOf("find booking") !== -1 || badN
       }
       if (!phoneMatch) continue;
 
-      // name match: require all name parts present in title or attendee names
+      // name match: require all name parts in title or attendee names
       var hay = (b.title ? normName(b.title) : "");
       for (var k = 0; k < attendees.length; k++) {
         var an = attendees[k] && (attendees[k].name || attendees[k].fullName);
@@ -236,8 +222,8 @@ if (badName === "find_booking" || badName.indexOf("find booking") !== -1 || badN
       matches.push({
         uid: b.uid || b.id || null,
         title: b.title || null,
-        startTime: b.startTime || b.start || b.startAt || null,
-        endTime: b.endTime || b.end || b.endAt || null,
+        startTime: b.start || b.startTime || b.startAt || null,
+        endTime: b.end || b.endTime || b.endAt || null,
         attendees: attendees.map(function(x) {
           x = x || {};
           return {
@@ -273,29 +259,12 @@ if (badName === "find_booking" || badName.indexOf("find booking") !== -1 || badN
     }
 
     if (matches.length > 1) {
-      console.log("FIND_BOOKING_RESULT", {
-        found: false,
-        reason: "multiple_matches",
-        count: matches.length
-      });
-
-      return res.status(200).json({
-        found: false,
-        reason: "multiple_matches",
-        matches: matches.slice(0, 5)
-      });
+      console.log("FIND_BOOKING_RESULT", { found: false, reason: "multiple_matches", count: matches.length });
+      return res.status(200).json({ found: false, reason: "multiple_matches", matches: matches.slice(0, 5) });
     }
 
-    console.log("FIND_BOOKING_RESULT", {
-      found: true,
-      uid: matches[0].uid,
-      title: matches[0].title
-    });
-
-    return res.status(200).json({
-      found: true,
-      booking: matches[0]
-    });
+    console.log("FIND_BOOKING_RESULT", { found: true, uid: matches[0].uid, title: matches[0].title });
+    return res.status(200).json({ found: true, booking: matches[0] });
 
   } catch (err) {
     return res.status(500).json({
