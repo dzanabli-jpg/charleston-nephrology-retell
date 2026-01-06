@@ -1,4 +1,4 @@
-// /api/retell-find-booking.js
+// /api/retell-find-booking.js (CommonJS)
 
 function normalizeDigits(str) {
   return String(str || "").replace(/\D/g, "");
@@ -7,18 +7,13 @@ function normalizeDigits(str) {
 function normalizeUSPhoneToE164(phoneLike) {
   const digits = normalizeDigits(phoneLike);
 
-  // If user gave 10 digits, assume US
   if (digits.length === 10) return `+1${digits}`;
-
-  // If user gave 11 digits starting with 1, treat as US
   if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
 
-  // If already includes country code with + but had symbols, fallback:
   if (String(phoneLike || "").trim().startsWith("+") && digits.length >= 11) {
     return `+${digits}`;
   }
 
-  // Otherwise return null to signal invalid
   return null;
 }
 
@@ -34,16 +29,17 @@ function normName(str) {
     .toLowerCase();
 }
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   try {
     // Only allow POST
     if (req.method !== "POST") {
       return res.status(405).json({ error: "Method not allowed" });
     }
 
-    // Auth check (Retell -> your endpoint)
+    // Auth check
     const auth = req.headers.authorization || "";
     const expected = process.env.RETELL_SHARED_SECRET;
+
     if (!expected) {
       return res.status(500).json({ error: "Server misconfigured: missing RETELL_SHARED_SECRET" });
     }
@@ -53,23 +49,23 @@ export default async function handler(req, res) {
 
     const body = req.body || {};
 
-    // Support multiple payload shapes Retell may send
+    // Support multiple payload shapes
     let full_name =
       body.full_name ??
       body.fullName ??
       body.name ??
-      body?.args?.full_name ??
-      body?.args?.fullName ??
-      body?.args?.name ??
+      (body.args && body.args.full_name) ??
+      (body.args && body.args.fullName) ??
+      (body.args && body.args.name) ??
       null;
 
     let phone_number =
       body.phone_number ??
       body.phoneNumber ??
       body.attendeePhoneNumber ??
-      body?.args?.phone_number ??
-      body?.args?.phoneNumber ??
-      body?.args?.attendeePhoneNumber ??
+      (body.args && body.args.phone_number) ??
+      (body.args && body.args.phoneNumber) ??
+      (body.args && body.args.attendeePhoneNumber) ??
       null;
 
     // args-only array payload: ["Emily Smith", "+1304..."]
@@ -111,8 +107,6 @@ export default async function handler(req, res) {
     }
 
     // ---- Cal.com API call ----
-    // NOTE: Cal.com API versions vary; this endpoint works for many setups.
-    // If your Cal.com uses a different path, we can adjust once we see the response.
     const calResp = await fetch("https://api.cal.com/v1/bookings", {
       method: "GET",
       headers: {
@@ -131,20 +125,83 @@ export default async function handler(req, res) {
       });
     }
 
-    const bookings = Array.isArray(calJson?.bookings) ? calJson.bookings : [];
+    const bookings = Array.isArray(calJson && calJson.bookings) ? calJson.bookings : [];
 
     const targetName = normName(full_name);
 
-    // Try to find matches by phone last-10 and name similarity.
-    // This is intentionally forgiving about formatting.
     const matches = [];
     for (const b of bookings) {
-      const attendees = Array.isArray(b?.attendees) ? b.attendees : [];
-      const bookingUid = b?.uid || b?.id || null;
+      const attendees = Array.isArray(b && b.attendees) ? b.attendees : [];
+      const bookingUid = (b && (b.uid || b.id)) || null;
 
-      // Pull attendee phone candidates
+      // collect possible phones
       const phones = attendees
-        .map((a) => a?.phoneNumber || a?.phone || a?.attendeePhoneNumber || "")
+        .map((a) => (a && (a.phoneNumber || a.phone || a.attendeePhoneNumber)) || "")
         .filter(Boolean);
 
-      // Sometimes phone i
+      if (b && b.metadata && b.metadata.attendeePhoneNumber) phones.push(b.metadata.attendeePhoneNumber);
+      if (b && b.responses && b.responses.attendeePhoneNumber) phones.push(b.responses.attendeePhoneNumber);
+
+      const anyPhoneMatch = phones.some((p) => last10(p) === phoneLast10);
+      if (!anyPhoneMatch) continue;
+
+      const attendeeNames = attendees
+        .map((a) => (a && (a.name || a.fullName)) || "")
+        .filter(Boolean)
+        .map(normName);
+
+      const title = normName((b && b.title) || "");
+      const nameHit =
+        attendeeNames.some((n) => n.includes(targetName) || targetName.includes(n)) ||
+        title.includes(targetName) ||
+        targetName
+          .split(" ")
+          .every((part) => part && (title.includes(part) || attendeeNames.some((n) => n.includes(part))));
+
+      if (!nameHit) continue;
+
+      matches.push({
+        uid: bookingUid,
+        title: (b && b.title) || null,
+        startTime: b && (b.startTime || b.start) ? (b.startTime || b.start) : null,
+        endTime: b && (b.endTime || b.end) ? (b.endTime || b.end) : null,
+        attendees: attendees.map((a) => ({
+          name: (a && (a.name || a.fullName)) || null,
+          phoneNumber: (a && (a.phoneNumber || a.phone || a.attendeePhoneNumber)) || null,
+          email: (a && a.email) || null,
+        })),
+      });
+    }
+
+    if (matches.length === 0) {
+      return res.status(200).json({
+        found: false,
+        reason: "no_match",
+        debug: {
+          full_name: full_name,
+          normalizedPhone,
+          phoneLast10,
+          bookings_checked: bookings.length,
+        },
+      });
+    }
+
+    if (matches.length > 1) {
+      return res.status(200).json({
+        found: false,
+        reason: "multiple_matches",
+        matches: matches.slice(0, 5),
+      });
+    }
+
+    return res.status(200).json({
+      found: true,
+      booking: matches[0],
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error: "Unhandled server error",
+      message: (err && err.message) || String(err),
+    });
+  }
+};
