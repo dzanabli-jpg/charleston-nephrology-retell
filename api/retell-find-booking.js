@@ -1,18 +1,16 @@
-// /api/retell-find-booking.js (Vercel Serverless, CommonJS, clean ASCII only)
+// /api/retell-find-booking.js
+// Vercel Serverless Function (CommonJS, clean ASCII only)
 //
 // REQUIRED Vercel Environment Variables:
-// - RETELL_SHARED_SECRET
-// - CALCOM_API_KEY
+// - RETELL_SHARED_SECRET   (must match token after "Bearer " in Retell header)
+// - CALCOM_API_KEY         (your Cal.com API key)
 //
-// Behavior:
-// - POST only
-// - Validates Authorization header
-// - Extracts full_name, phone_number, dob from Retell args
-// - Normalizes phone to +1XXXXXXXXXX and matches by last-10
-// - Normalizes DOB to MM/DD/YY and matches against bookingFieldsResponses / metadata / description notes
-// - Fetches Cal.com v2 bookings with take=100 (+ cursor if provided)
-// - If multiple matches, auto-selects the best one (soonest upcoming; else most recent)
-// - Returns found:true with the selected booking
+// PURPOSE:
+// - Find a Cal.com v2 booking by: full_name + phone (last10) + DOB (MM/DD/YY)
+// - Handles DOB stored as strings, nested objects, arrays, or ISO "YYYY-MM-DD"
+// - Handles phone stored in attendees, bookingFieldsResponses, metadata, etc.
+// - If multiple matches, auto-selects best (soonest upcoming else most recent)
+// - Provides controlled debug logs when no match occurs
 
 function normalizeDigits(str) {
   return String(str || "").replace(/\D/g, "");
@@ -46,10 +44,55 @@ function normName(str) {
     .toLowerCase();
 }
 
-// Accepts many DOB formats, returns MM/DD/YY or null
+// Deeply flattens ANY object/array into a list of string-ish leaf values.
+function flattenToStrings(input) {
+  var out = [];
+  var seen = new Set();
+
+  function walk(x) {
+    if (x === null || x === undefined) return;
+
+    if (typeof x === "object") {
+      if (seen.has(x)) return;
+      seen.add(x);
+    }
+
+    if (typeof x === "string") {
+      var s = x.trim();
+      if (s) out.push(s);
+      return;
+    }
+
+    if (typeof x === "number" || typeof x === "boolean") {
+      out.push(String(x));
+      return;
+    }
+
+    if (Array.isArray(x)) {
+      for (var i = 0; i < x.length; i++) walk(x[i]);
+      return;
+    }
+
+    if (typeof x === "object") {
+      for (var k in x) walk(x[k]);
+      return;
+    }
+  }
+
+  walk(input);
+  return out;
+}
+
+// Normalize DOB to MM/DD/YY
 function normalizeDobToMMDDYY(dobLike) {
   var raw = String(dobLike || "").trim();
   if (!raw) return null;
+
+  // Support ISO: YYYY-MM-DD
+  var iso = raw.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    return iso[2] + "/" + iso[3] + "/" + iso[1].slice(2);
+  }
 
   var monthMap = {
     jan: "01", january: "01",
@@ -68,6 +111,7 @@ function normalizeDobToMMDDYY(dobLike) {
 
   var lower = raw.toLowerCase();
   var mm = null;
+
   var keys = Object.keys(monthMap);
   for (var i = 0; i < keys.length; i++) {
     if (lower.indexOf(keys[i]) !== -1) {
@@ -76,12 +120,11 @@ function normalizeDobToMMDDYY(dobLike) {
     }
   }
 
-  // Extract numeric groups
   var nums = raw.match(/\d+/g);
   var dd = null;
   var yy = null;
 
-  // Try patterns like 02/24/2008 or 2-24-08
+  // Pattern: MM/DD/YYYY or MM/DD/YY (or with dashes)
   if (nums && nums.length >= 3) {
     var n1 = parseInt(nums[0], 10);
     var n2 = parseInt(nums[1], 10);
@@ -94,7 +137,7 @@ function normalizeDobToMMDDYY(dobLike) {
     else if (n3 >= 0 && n3 <= 99) yy = pad2(n3);
   }
 
-  // Month name + day + year (e.g., February 24 2008)
+  // Pattern: Month name + day + year
   if (mm && nums && nums.length >= 2 && (!dd || !yy)) {
     for (var j = 0; j < nums.length; j++) {
       var v = parseInt(nums[j], 10);
@@ -106,10 +149,11 @@ function normalizeDobToMMDDYY(dobLike) {
     }
   }
 
-  // Month name + two nums (January 1 2000)
+  // Pattern: Month name + two nums (January 1 2000)
   if (mm && nums && nums.length === 2 && (!dd || !yy)) {
     var d1 = parseInt(nums[0], 10);
     if (!dd && d1 >= 1 && d1 <= 31) dd = pad2(d1);
+
     if (!yy) {
       if (String(nums[1]).length === 4) yy = String(nums[1]).slice(2);
       else yy = pad2(parseInt(nums[1], 10));
@@ -125,7 +169,7 @@ function extractArgs(body) {
   var argsObj = body.args && typeof body.args === "object" ? body.args : null;
 
   var full_name =
-    (argsObj && (argsObj.full_name || argsObj.fullName || argsObj.caller_name || argsObj.callerName || argsObj.name)) ||
+    (argsObj && (argsObj.full_name || argsObj.fullName || argsObj.name || argsObj.caller_name || argsObj.callerName)) ||
     body.full_name ||
     body.fullName ||
     body.caller_name ||
@@ -133,12 +177,12 @@ function extractArgs(body) {
     null;
 
   var phone_number =
-    (argsObj && (argsObj.phone_number || argsObj.phoneNumber || argsObj.caller_phone || argsObj.callerPhone || argsObj.attendeePhoneNumber)) ||
+    (argsObj && (argsObj.phone_number || argsObj.phoneNumber || argsObj.attendeePhoneNumber || argsObj.caller_phone || argsObj.callerPhone)) ||
     body.phone_number ||
     body.phoneNumber ||
+    body.attendeePhoneNumber ||
     body.caller_phone ||
     body.callerPhone ||
-    body.attendeePhoneNumber ||
     null;
 
   var dob =
@@ -153,8 +197,10 @@ function extractArgs(body) {
 
 function extractPhonesFromBooking(b) {
   var phones = [];
+
   if (!b || typeof b !== "object") return phones;
 
+  // Attendees
   var attendees = Array.isArray(b.attendees) ? b.attendees : [];
   for (var i = 0; i < attendees.length; i++) {
     var a = attendees[i] || {};
@@ -163,19 +209,9 @@ function extractPhonesFromBooking(b) {
     if (a.attendeePhoneNumber) phones.push(a.attendeePhoneNumber);
   }
 
-  if (b.bookingFieldsResponses && typeof b.bookingFieldsResponses === "object") {
-    for (var k in b.bookingFieldsResponses) {
-      var v = b.bookingFieldsResponses[k];
-      if (typeof v === "string" && normalizeDigits(v).length >= 10) phones.push(v);
-    }
-  }
-
-  if (b.metadata && typeof b.metadata === "object") {
-    for (var m in b.metadata) {
-      var mv = b.metadata[m];
-      if (typeof mv === "string" && normalizeDigits(mv).length >= 10) phones.push(mv);
-    }
-  }
+  // Deep scan bookingFieldsResponses + metadata too (phone can be nested)
+  phones = phones.concat(flattenToStrings(b.bookingFieldsResponses));
+  phones = phones.concat(flattenToStrings(b.metadata));
 
   return phones;
 }
@@ -184,19 +220,8 @@ function extractDobCandidates(b) {
   var out = [];
   if (!b || typeof b !== "object") return out;
 
-  if (b.bookingFieldsResponses && typeof b.bookingFieldsResponses === "object") {
-    for (var k in b.bookingFieldsResponses) {
-      var v = b.bookingFieldsResponses[k];
-      if (typeof v === "string" && v.trim()) out.push(v.trim());
-    }
-  }
-
-  if (b.metadata && typeof b.metadata === "object") {
-    for (var m in b.metadata) {
-      var mv = b.metadata[m];
-      if (typeof mv === "string" && mv.trim()) out.push(mv.trim());
-    }
-  }
+  out = out.concat(flattenToStrings(b.bookingFieldsResponses));
+  out = out.concat(flattenToStrings(b.metadata));
 
   if (typeof b.description === "string" && b.description.trim()) out.push(b.description.trim());
   if (typeof b.additionalNotes === "string" && b.additionalNotes.trim()) out.push(b.additionalNotes.trim());
@@ -211,15 +236,14 @@ function parseTimeMs(val) {
 }
 
 async function fetchBookings(apiKey) {
-  // Best-effort: take=100 plus cursor if the API returns one.
   var all = [];
-  var take = 100;
   var cursor = null;
   var guard = 0;
 
   while (guard < 20) {
     guard++;
-    var url = "https://api.cal.com/v2/bookings?take=" + take;
+
+    var url = "https://api.cal.com/v2/bookings?take=100";
     if (cursor) url += "&cursor=" + encodeURIComponent(cursor);
 
     var resp = await fetch(url, {
@@ -284,7 +308,7 @@ module.exports = async function handler(req, res) {
 
     var normalizedDob = normalizeDobToMMDDYY(args.dob);
     if (!normalizedDob) {
-      return res.status(400).json({ error: "Invalid DOB", dob_received: args.dob, expected: "MM/DD/YY" });
+      return res.status(400).json({ error: "Invalid DOB", dob_received: args.dob });
     }
 
     var apiKey = process.env.CALCOM_API_KEY;
@@ -304,11 +328,12 @@ module.exports = async function handler(req, res) {
     for (var i = 0; i < bookings.length; i++) {
       var b = bookings[i] || {};
 
-      // Phone last-10 match
+      // Phone match by last-10
       var phones = extractPhonesFromBooking(b);
       var okPhone = false;
       for (var p = 0; p < phones.length; p++) {
-        if (last10(phones[p]) === phoneLast10) { okPhone = true; break; }
+        var l10 = last10(phones[p]);
+        if (l10 && l10 === phoneLast10) { okPhone = true; break; }
       }
       if (!okPhone) continue;
 
@@ -317,20 +342,24 @@ module.exports = async function handler(req, res) {
       var okDob = false;
       for (var d = 0; d < dobCandidates.length; d++) {
         var cand = dobCandidates[d];
-        var m = String(cand).match(/(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/);
+
+        // Try to pull MM/DD/YY-ish substring if present
+        var m = String(cand).match(/(\d{4}-\d{2}-\d{2}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/);
         var maybe = m ? m[1] : cand;
+
         var nd = normalizeDobToMMDDYY(maybe);
         if (nd && nd === normalizedDob) { okDob = true; break; }
       }
       if (!okDob) continue;
 
-      // Name match (parts must appear somewhere in title or attendee names)
+      // Name match (parts in title/attendee names; mild, but keeps safety)
       var attendees = Array.isArray(b.attendees) ? b.attendees : [];
       var hay = (b.title ? normName(b.title) : "");
       for (var k = 0; k < attendees.length; k++) {
         var an = attendees[k] && (attendees[k].name || attendees[k].fullName);
         if (an) hay += " " + normName(an);
       }
+
       var okName = true;
       for (var np = 0; np < nameParts.length; np++) {
         if (nameParts[np] && hay.indexOf(nameParts[np]) === -1) { okName = false; break; }
@@ -352,27 +381,39 @@ module.exports = async function handler(req, res) {
     }
 
     if (matches.length === 0) {
+      // DEBUG: print a compact sample of phone/dob-containing fields from the first few bookings
+      var samples = [];
+      for (var s = 0; s < Math.min(5, bookings.length); s++) {
+        var bb = bookings[s] || {};
+        samples.push({
+          uid: bb.uid || bb.id || null,
+          title: bb.title || null,
+          phones_sample: extractPhonesFromBooking(bb).slice(0, 8),
+          dob_sample: extractDobCandidates(bb).slice(0, 8)
+        });
+      }
+
       console.log("FIND_BOOKING_RESULT", {
         found: false,
         reason: "no_match",
         normalizedDob: normalizedDob,
         phoneLast10: phoneLast10,
-        bookings_checked: bookings.length
+        bookings_checked: bookings.length,
+        sample_first5: samples
       });
+
       return res.status(200).json({ found: false, reason: "no_match" });
     }
 
-    // Auto-select best match (do NOT make the agent deal with multiple)
+    // Auto-select best match (no "multiple appointments" UX)
     var now = Date.now();
-
     var upcoming = matches.filter(function(x) { return x._startMs && x._startMs >= now; });
-    var best = null;
 
+    var best = null;
     if (upcoming.length > 0) {
       upcoming.sort(function(a, b) { return a._startMs - b._startMs; });
       best = upcoming[0];
     } else {
-      // Fall back to most recently updated/created
       matches.sort(function(a, b) {
         var aScore = a._updatedMs || a._createdMs || 0;
         var bScore = b._updatedMs || b._createdMs || 0;
@@ -389,7 +430,6 @@ module.exports = async function handler(req, res) {
       selected_status: best.status
     });
 
-    // Remove internal helper fields
     delete best._startMs;
     delete best._createdMs;
     delete best._updatedMs;
