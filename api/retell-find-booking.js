@@ -7,10 +7,10 @@
 //
 // PURPOSE:
 // - Find a Cal.com v2 booking by: full_name + phone (last10) + DOB (MM/DD/YY)
-// - Handles DOB stored as strings, nested objects, arrays, or ISO "YYYY-MM-DD"
+// - Handles DOB stored as strings, nested objects/arrays, or ISO "YYYY-MM-DD"
 // - Handles phone stored in attendees, bookingFieldsResponses, metadata, etc.
-// - If multiple matches, auto-selects best (soonest upcoming else most recent)
-// - Provides controlled debug logs when no match occurs
+// - If multiple matches, prefers a NON-CANCELLED booking first, then soonest upcoming
+// - Logs FIND_BOOKING_RESULT
 
 function normalizeDigits(str) {
   return String(str || "").replace(/\D/g, "");
@@ -197,10 +197,8 @@ function extractArgs(body) {
 
 function extractPhonesFromBooking(b) {
   var phones = [];
-
   if (!b || typeof b !== "object") return phones;
 
-  // Attendees
   var attendees = Array.isArray(b.attendees) ? b.attendees : [];
   for (var i = 0; i < attendees.length; i++) {
     var a = attendees[i] || {};
@@ -209,7 +207,6 @@ function extractPhonesFromBooking(b) {
     if (a.attendeePhoneNumber) phones.push(a.attendeePhoneNumber);
   }
 
-  // Deep scan bookingFieldsResponses + metadata too (phone can be nested)
   phones = phones.concat(flattenToStrings(b.bookingFieldsResponses));
   phones = phones.concat(flattenToStrings(b.metadata));
 
@@ -343,7 +340,6 @@ module.exports = async function handler(req, res) {
       for (var d = 0; d < dobCandidates.length; d++) {
         var cand = dobCandidates[d];
 
-        // Try to pull MM/DD/YY-ish substring if present
         var m = String(cand).match(/(\d{4}-\d{2}-\d{2}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/);
         var maybe = m ? m[1] : cand;
 
@@ -352,7 +348,7 @@ module.exports = async function handler(req, res) {
       }
       if (!okDob) continue;
 
-      // Name match (parts in title/attendee names; mild, but keeps safety)
+      // Name match
       var attendees = Array.isArray(b.attendees) ? b.attendees : [];
       var hay = (b.title ? normName(b.title) : "");
       for (var k = 0; k < attendees.length; k++) {
@@ -381,45 +377,54 @@ module.exports = async function handler(req, res) {
     }
 
     if (matches.length === 0) {
-      // DEBUG: print a compact sample of phone/dob-containing fields from the first few bookings
-      var samples = [];
-      for (var s = 0; s < Math.min(5, bookings.length); s++) {
-        var bb = bookings[s] || {};
-        samples.push({
-          uid: bb.uid || bb.id || null,
-          title: bb.title || null,
-          phones_sample: extractPhonesFromBooking(bb).slice(0, 8),
-          dob_sample: extractDobCandidates(bb).slice(0, 8)
-        });
-      }
-
       console.log("FIND_BOOKING_RESULT", {
         found: false,
         reason: "no_match",
         normalizedDob: normalizedDob,
         phoneLast10: phoneLast10,
-        bookings_checked: bookings.length,
-        sample_first5: samples
+        bookings_checked: bookings.length
       });
 
       return res.status(200).json({ found: false, reason: "no_match" });
     }
 
-    // Auto-select best match (no "multiple appointments" UX)
+    // ✅ UPDATED SELECTION LOGIC:
+    // Prefer NON-CANCELLED bookings first, then soonest upcoming, etc.
     var now = Date.now();
-    var upcoming = matches.filter(function(x) { return x._startMs && x._startMs >= now; });
+
+    var active = matches.filter(function(x) {
+      return String(x.status || "").toLowerCase() !== "cancelled";
+    });
+
+    var activeUpcoming = active.filter(function(x) {
+      return x._startMs && x._startMs >= now;
+    });
 
     var best = null;
-    if (upcoming.length > 0) {
-      upcoming.sort(function(a, b) { return a._startMs - b._startMs; });
-      best = upcoming[0];
-    } else {
-      matches.sort(function(a, b) {
+
+    if (activeUpcoming.length > 0) {
+      activeUpcoming.sort(function(a, b) { return a._startMs - b._startMs; });
+      best = activeUpcoming[0];
+    } else if (active.length > 0) {
+      active.sort(function(a, b) {
         var aScore = a._updatedMs || a._createdMs || 0;
         var bScore = b._updatedMs || b._createdMs || 0;
         return bScore - aScore;
       });
-      best = matches[0];
+      best = active[0];
+    } else {
+      var canceledUpcoming = matches.filter(function(x) { return x._startMs && x._startMs >= now; });
+      if (canceledUpcoming.length > 0) {
+        canceledUpcoming.sort(function(a, b) { return a._startMs - b._startMs; });
+        best = canceledUpcoming[0];
+      } else {
+        matches.sort(function(a, b) {
+          var aScore = a._updatedMs || a._createdMs || 0;
+          var bScore = b._updatedMs || b._createdMs || 0;
+          return bScore - aScore;
+        });
+        best = matches[0];
+      }
     }
 
     console.log("FIND_BOOKING_RESULT", {
