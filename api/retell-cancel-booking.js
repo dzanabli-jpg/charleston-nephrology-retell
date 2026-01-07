@@ -55,8 +55,7 @@ module.exports = async function handler(req, res) {
         "Content-Type": "application/json",
         "cal-api-version": "2024-08-13"
       },
-      body: JSON.stringify({}) // Cal expects POST; empty body is fine
-      cancellationReason: "Canceled by caller request"
+      body: JSON.stringify({ cancellationReason: "Canceled by caller request" }) // Cal expects POST; empty body is fine
     });
 
     var calJson = null;
