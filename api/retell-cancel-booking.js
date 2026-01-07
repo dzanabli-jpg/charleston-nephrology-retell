@@ -1,18 +1,30 @@
-// /api/retell-cancel-booking.js (CommonJS - Retell + Cal.com v2)
+// /api/retell-cancel-booking.js
+// Vercel Serverless Function (CommonJS)
 //
-// Env vars required:
+// ENV:
 // - RETELL_SHARED_SECRET
 // - CALCOM_API_KEY
 //
-// Retell should call this with args:
-// - booking_uid (string)
-// - cancellation_reason (string, optional)
+// Input (Retell tool args):
+// - booking_uid (string) OR uid (string)
+//
+// Output:
+// - { ok: true, already_cancelled: false }
+// - { ok: false, already_cancelled: true }
+// - { ok: false, already_cancelled: false, error: "..." }
 
-function pickArg(body, key) {
+function extractUid(body) {
   body = body || {};
-  if (body.args && typeof body.args === "object" && body.args[key] !== undefined) return body.args[key];
-  if (body[key] !== undefined) return body[key];
-  return undefined;
+  var args = body.args && typeof body.args === "object" ? body.args : body;
+
+  return (
+    args.booking_uid ||
+    args.bookingUid ||
+    args.uid ||
+    args.booking_id ||
+    args.bookingId ||
+    null
+  );
 }
 
 module.exports = async function handler(req, res) {
@@ -30,57 +42,49 @@ module.exports = async function handler(req, res) {
     var apiKey = process.env.CALCOM_API_KEY;
     if (!apiKey) return res.status(500).json({ error: "Missing CALCOM_API_KEY" });
 
-    var body = req.body || {};
-    console.log("RETELL_CANCEL_REQUEST_BODY", body);
+    var uid = extractUid(req.body || {});
+    if (!uid) return res.status(400).json({ error: "Missing booking uid" });
 
-    var bookingUid = pickArg(body, "booking_uid") || pickArg(body, "bookingUid") || pickArg(body, "uid");
-    var cancellationReason =
-      pickArg(body, "cancellation_reason") ||
-      pickArg(body, "cancellationReason") ||
-      "Cancelled at patient request";
+    // Call Cal.com cancel endpoint
+    var url = "https://api.cal.com/v2/bookings/" + encodeURIComponent(uid) + "/cancel";
 
-    if (!bookingUid || typeof bookingUid !== "string") {
-      return res.status(400).json({ error: "Missing booking_uid" });
-    }
-
-    var calResp = await fetch("https://api.cal.com/v2/bookings/" + encodeURIComponent(bookingUid) + "/cancel", {
+    var calResp = await fetch(url, {
       method: "POST",
       headers: {
         "Authorization": "Bearer " + apiKey,
         "Content-Type": "application/json",
         "cal-api-version": "2024-08-13"
       },
-      body: JSON.stringify({
-        cancellationReason: String(cancellationReason).slice(0, 300)
-      })
+      body: JSON.stringify({}) // Cal expects POST; empty body is fine
     });
 
     var calJson = null;
-    try {
-      calJson = await calResp.json();
-    } catch (e) {
-      calJson = null;
+    try { calJson = await calResp.json(); } catch (e) { calJson = null; }
+
+    if (calResp.ok) {
+      console.log("CANCEL_BOOKING_RESULT", { ok: true, uid: uid });
+      return res.status(200).json({ ok: true, already_cancelled: false });
     }
 
-    if (!calResp.ok) {
-      console.log("CANCEL_BOOKING_RESULT", { ok: false, status: calResp.status, calJson: calJson });
-      return res.status(502).json({
-        error: "Cal.com cancel error",
-        status: calResp.status,
-        response: calJson
-      });
-    }
+    // Detect "already cancelled" condition
+    var msg =
+      (calJson && calJson.error && calJson.error.message) ||
+      (calJson && calJson.message) ||
+      "";
 
-    console.log("CANCEL_BOOKING_RESULT", { ok: true, booking_uid: bookingUid });
+    var already =
+      String(msg).toLowerCase().indexOf("already") !== -1 &&
+      (String(msg).toLowerCase().indexOf("cancelled") !== -1 || String(msg).toLowerCase().indexOf("canceled") !== -1);
+
+    console.log("CANCEL_BOOKING_RESULT", { ok: false, status: calResp.status, already_cancelled: already, calJson: calJson });
+
     return res.status(200).json({
-      success: true,
-      booking_uid: bookingUid,
-      cal: calJson
+      ok: false,
+      already_cancelled: already,
+      error: msg || "Cancel failed"
     });
   } catch (err) {
-    return res.status(500).json({
-      error: "Unhandled server error",
-      message: (err && err.message) || String(err)
-    });
+    console.log("CANCEL_BOOKING_RESULT", { ok: false, error: (err && err.message) || String(err) });
+    return res.status(200).json({ ok: false, already_cancelled: false, error: (err && err.message) || String(err) });
   }
 };
